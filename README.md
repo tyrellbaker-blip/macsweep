@@ -2,14 +2,24 @@
 
 Reclaim disk space on a Mac without losing anything you care about.
 
-It does two things:
+It does three things:
 
 - **Delete** caches and build output that regenerate on their own
 - **Archive** cold files to an external drive, leaving a symlink so the
   original path still works while the drive is plugged in
+- **Report** everything big it won't touch itself, with the exact command
+  that reclaims it
 
 You approve each category before anything happens, and it explains what each
 one actually is before it asks.
+
+That third one matters more than it sounds. A narrow whitelist keeps the
+automatic deletion safe, but narrow must not mean silent: the biggest wins on
+a real machine are usually things no script should delete on its own —
+Homebrew and Anaconda in `/opt`, an oversized Spotlight index, old iPhone
+backups, a Windows game inside a CrossOver bottle, `/Applications` itself.
+macsweep measures all of it and hands you the command. It will never quietly
+omit a number because it decided not to act on it.
 
 ```
 git clone https://github.com/tyrellbaker-blip/macsweep.git
@@ -39,14 +49,22 @@ went and what it *would* offer to do. Read it, then run it for real.
    explanation of what those files are. Answer y or n.
 4. **A final confirmation** before anything is touched.
 
-## The two kinds of action
+## The two actions it takes itself
 
 ### DELETE — gone, not in the Trash
 
 Only from a fixed whitelist in the source: Gradle and npm and Maven caches,
 Xcode DerivedData and device support, Android emulator images, `Library/Caches`,
-`Library/Logs`, and similar. Every one of them is rebuilt or re-downloaded on
-demand.
+`Library/Logs`, downloaded browser binaries, and the Trash itself. Every one of
+them is rebuilt or re-downloaded on demand.
+
+It also finds build output **inside your projects** — `node_modules`, `target`,
+`Pods`, `.next`, `build`. Across years of projects this is often the single
+largest recoverable chunk on a developer's machine. Each one is only counted
+when a sibling file proves what it is: `node_modules` beside `package.json`,
+`target` beside `Cargo.toml`, `build` beside `build.gradle`. A folder named
+`build` that is actually source is left alone, and macsweep never descends
+into build output to find more build output.
 
 macsweep will **not** delete a file because it looks old, or large, or has an
 extension it doesn't recognize. If a path isn't on the list, it isn't deleted.
@@ -82,11 +100,22 @@ Copies archived items back from the drive. Every run writes a log to
 
 Deletes can't be undone. That's what the whitelist is for.
 
-## Never touched
+## Never touched — but always measured
 
 Keychains, Preferences, Mail, Messages, Contacts, Calendars, Safari data,
 `.ssh`, `.gnupg`, `.aws`, `.config`, and anything under iCloud Drive,
 OneDrive, Dropbox, or Google Drive.
+
+These are excluded from **actions**, not from the **report**. If your Mail
+cache is 7G, that line appears with the setting that shrinks it. An earlier
+version skipped measuring protected paths entirely, which meant a 9G folder
+could sit there invisible while the tool congratulated itself on finding 6G of
+cache. Refusing to act on something is a safety feature; refusing to mention
+it is a blind spot.
+
+The only exception is cloud folders, which genuinely cannot be walked — every
+dataless placeholder you `stat()` may trigger a download. Those are named and
+counted, not sized, with a pointer to the sync app's own eviction control.
 
 Two more categories are measured and reported but never acted on:
 
@@ -134,21 +163,33 @@ Some folders need Full Disk Access. If you see permission errors, add Terminal
 under System Settings → Privacy & Security → Full Disk Access, then quit and
 reopen Terminal.
 
-## What it can't reach
+## Outside your home folder
 
-Space outside your home folder — `/Applications`, `/Library`, Homebrew in
-`/opt` — isn't touched. If the scan doesn't add up to what System Settings
-reports, look there:
+macsweep won't *modify* anything outside your home folder, but it does look:
+`/Applications`, `/opt/homebrew`, `/opt/anaconda3`, `/Library/Updates`,
+`/Library/Application Support`. Anything over 1G shows up in the review
+section with its command — `brew cleanup --prune=all`, `conda clean --all`,
+and so on.
+
+It also checks for local Time Machine snapshots. Those pin blocks you've
+already freed, so deleting things can appear to accomplish nothing until
+they're thinned. If any exist you get:
+
+```
+sudo tmutil thinlocalsnapshots / 100000000000 4
+```
+
+If the numbers still don't add up to what System Settings reports:
 
 ```
 sudo du -xhd 1 /System/Volumes/Data 2>/dev/null | sort -rh | head -20
 ```
 
-Common finds: an oversized Homebrew or Anaconda install in `/opt`, a runaway
-Spotlight index in `~/Library/Metadata/CoreSpotlight`, and Messages attachments
-in `~/Library/Messages/Attachments` (which macsweep leaves alone, because
-Messages tracks those files in a database and deleting them behind its back
-breaks conversations).
+One thing macsweep deliberately won't automate: Messages attachments in
+`~/Library/Messages/Attachments`. Messages tracks those files in a database,
+so deleting them behind its back breaks conversations. It's reported with two
+safe routes — the retention setting, or copying the folder to your drive
+first if you want to keep them.
 
 ## License
 
