@@ -36,8 +36,10 @@ GB = 1 << 30
 STATE = os.path.join(HOME, ".macsweep")
 
 # How long a single folder may be walked before we give up on it. Cloud-synced
-# folders can stall for hours -- see the note on CLOUD below.
-WALK_BUDGET = 90.0
+# folders can stall for hours -- see the note on CLOUD below. Six minutes is
+# generous enough for a genuinely large local tree (a 200GB Photos library on a
+# slow external, say) while still cutting off anything that is really stuck.
+WALK_BUDGET = 360.0
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +280,8 @@ still open them whenever the drive is plugged in."""),
     ("media", "ARCHIVE", "Large media files", """
 Videos and images sitting loose in your folders. Moved to the external drive
 with a symlink left behind, so the file still appears at its original path
-while the drive is connected. Photos and iMovie libraries are deliberately
-excluded -- those have to be moved from inside the app itself or they break."""),
+while the drive is connected. Photos and iMovie libraries are handled
+separately, further down, because they need a different treatment."""),
 
     ("projects", "ARCHIVE", "Cold project folders", """
 Project directories you have not touched in months. Moved, not deleted. Any
@@ -289,6 +291,39 @@ progress stays where it is.
 Be deliberate here: while the drive is unplugged, these paths stop resolving.
 Archive things you are genuinely done with, not the project you'll open
 tomorrow."""),
+
+    ("documents", "ARCHIVE", "Cold documents and folders", """
+Files and folders in Documents and on the Desktop that you have not opened in
+months. Tax paperwork from three years ago, finished coursework, scans,
+exports, the folder from a job you already left.
+
+These are moved to the drive, not deleted, and a link stays behind so the path
+still works whenever the drive is connected. Nothing here is judged by what is
+inside it -- only by how long since you last touched it -- so read the list
+before you approve it."""),
+
+    ("libraries", "RELOCATE", "Photo, video and music libraries", """
+A Photos, iMovie, Final Cut, Logic or Music library is usually the single
+largest thing a non-developer owns. Moving one to an external drive is a
+supported, normal thing to do -- Apple documents it.
+
+It works differently from everything else here. These libraries record their
+own location internally, so a symlink breaks them. Instead macsweep copies the
+library to the drive, verifies it, removes the original, and leaves NO link.
+You then point the app at the new copy once:
+
+  Photos    hold Option while opening Photos, choose the library on the drive
+  iMovie    File > Open Library > Other, pick it on the drive
+  Music     hold Option while opening Music
+  Logic     it will ask on next launch
+
+After that the app remembers, and it opens normally every time the drive is
+attached. With the drive unplugged, the app will say it cannot find its
+library -- it is not damaged, it is on the drive.
+
+Two things to know before saying yes. If this is your System Photo Library and
+you use iCloud Photos, keep the drive connected while Photos is open or syncing
+will pause. And the copy is large, so this step can take a while."""),
 
     ("bigfiles", "ARCHIVE", "Large, old individual files", """
 Single files over the size threshold that have not been touched in months --
@@ -620,8 +655,10 @@ def collect_roots():
 def scan(opts) -> dict:
     header("Looking at your disk")
     print("  Measuring what is actually on disk. Cloud-synced folders are")
-    print("  skipped, and any folder that takes more than %ds is abandoned" % WALK_BUDGET)
-    print("  rather than left to stall.")
+    limit = ("%.0f minutes" % (opts.budget / 60) if opts.budget >= 60
+             else "%.0f seconds" % opts.budget)
+    print("  skipped, and any folder that takes more than %s is" % limit)
+    print("  abandoned rather than left to stall.")
     print()
 
     walker = Walker()
@@ -687,6 +724,9 @@ def scan(opts) -> dict:
 
     # --- ARCHIVE candidates ----------------------------------------------
     candidates += find_archivable(opts, walker)
+
+    # --- Media libraries, which move rather than symlink ------------------
+    candidates += find_libraries(opts, walker)
 
     candidates = prune_nested(candidates)
     candidates.sort(key=lambda x: x["bytes"], reverse=True)
@@ -802,6 +842,30 @@ def find_archivable(opts, walker):
                         note="no changes in %d days" % info["age"])
             out.append(info)
 
+    # Cold documents and folders in Documents / Desktop
+    for folder in ("Documents", "Desktop"):
+        base = os.path.join(HOME, folder)
+        if not os.path.isdir(base) or is_never_touch(base):
+            continue
+        for entry in list_entries(base):
+            if is_bundle(entry) or os.path.basename(entry).startswith("."):
+                continue
+            if is_never_touch(entry) or is_hands_off(entry) or is_cloud(entry):
+                continue
+            if any(entry == o["path"] for o in out):
+                continue
+            info = entry_info(entry, walker, opts)
+            if not info:
+                continue
+            floor = opts.big_dir_mb if os.path.isdir(entry) else opts.big_file_mb
+            if info["bytes"] < floor * MB or info["age"] < opts.cold_days:
+                continue
+            if os.path.isdir(entry) and git_dirty(entry):
+                continue
+            info.update(action="ARCHIVE", category="documents",
+                        note="untouched %d days" % info["age"])
+            out.append(info)
+
     # Large cold individual files anywhere in the scanned roots
     for folder in ("Downloads", "Documents", "Desktop", "Movies"):
         base = os.path.join(HOME, folder)
@@ -821,6 +885,35 @@ def find_archivable(opts, walker):
                         note="%d days old" % info["age"])
             out.append(info)
 
+    return out
+
+
+def find_libraries(opts, walker):
+    """Photos / iMovie / Logic / Music libraries, anywhere obvious.
+
+    These are relocated rather than symlinked: the bundle records its own
+    location, so a link breaks the app. See the "libraries" category text.
+    """
+    out = []
+    seen = set()
+    places = [os.path.join(HOME, n) for n in
+              ("Pictures", "Movies", "Music", "Documents", "Desktop")] + [HOME]
+    for base in places:
+        if not os.path.isdir(base) or is_never_touch(base):
+            continue
+        for entry in list_entries(base):
+            if entry in seen or not is_bundle(entry):
+                continue
+            if entry.lower().endswith((".sparsebundle", ".dmg.sparseimage")):
+                continue        # disk images, handled as ordinary big files
+            seen.add(entry)
+            info = entry_info(entry, walker, opts)
+            if not info or info["bytes"] < opts.big_dir_mb * MB:
+                continue
+            kind = os.path.splitext(entry)[1].lstrip(".")
+            info.update(action="RELOCATE", category="libraries",
+                        note="%s library, %s" % (kind, human(info["bytes"])))
+            out.append(info)
     return out
 
 
@@ -888,7 +981,29 @@ def find_project_junk(opts, walker, max_depth=4):
     return found
 
 
-def du_bytes(path, timeout=45):
+def is_project_junk(path):
+    """Re-validate a project build folder at execution time.
+
+    execute() calls this rather than trusting the plan, so a hand-edited or
+    stale manifest cannot get a folder deleted that no longer has its guard
+    file beside it.
+    """
+    name = os.path.basename(path)
+    parent = os.path.dirname(path)
+    rules = [(guard, why) for n, guard, why in PROJECT_JUNK if n == name]
+    if not rules:
+        return None
+    try:
+        names = set(os.listdir(parent))
+    except OSError:
+        return None
+    for guard, why in rules:
+        if not guard or guard in names or any(n.endswith(guard) for n in names):
+            return why
+    return None
+
+
+def du_bytes(path, timeout=180):
     """Size via du, for places Python cannot walk without sudo. None on fail."""
     try:
         r = subprocess.run(["du", "-skx", path], capture_output=True,
@@ -961,7 +1076,7 @@ def find_review(measured, opts):
             continue
         size = sized.get(path)
         if size is None:
-            size = du_bytes(path, 60)
+            size = du_bytes(path, 240)
         if size and size >= 1 * GB:
             named.append(path)
             add(prefix, size, why, cmds)
@@ -1041,7 +1156,7 @@ def find_review(measured, opts):
     # 5. Simulators, which accumulate silently.
     sim = os.path.join(HOME, "Library/Developer/CoreSimulator/Devices")
     if os.path.isdir(sim):
-        size = du_bytes(sim, 60)
+        size = du_bytes(sim, 240)
         if size and size >= 1 * GB:
             add("Library/Developer/CoreSimulator/Devices", size,
                 "Simulator devices, including ones for SDKs you no longer have.",
@@ -1106,7 +1221,8 @@ def review(candidates, opts):
         header("%s  --  %s" % (title, human(total)))
         print(explanation.strip("\n"))
         print()
-        tag = red("DELETE") if action == "DELETE" else green("ARCHIVE")
+        tag = {"DELETE": red("DELETE"), "ARCHIVE": green("ARCHIVE"),
+               "RELOCATE": yellow("MOVED to the drive")}[action]
         print("  These would be %s:" % tag)
         print()
         for item in group[:20]:
@@ -1122,6 +1238,11 @@ def review(candidates, opts):
         if action == "DELETE":
             print(yellow("  Deleting is permanent. Everything above regenerates,"))
             print(yellow("  but it will not be in the Trash."))
+        elif action == "RELOCATE":
+            print(yellow("  These are copied to the drive and verified, then the"))
+            print(yellow("  original is removed. No link is left behind, so you"))
+            print(yellow("  point the app at the new location once (instructions"))
+            print(yellow("  are printed when it finishes)."))
         else:
             print("  Originals are replaced with symlinks. While the drive is")
             print("  unplugged these paths stop working; plug it back in and")
@@ -1231,6 +1352,52 @@ def tally(path):
     return count, size
 
 
+# Apps that hold a library open. Moving a library out from under a running
+# app corrupts it, so the move is refused while one of these is running.
+LIBRARY_APPS = {
+    ".photoslibrary": "Photos",
+    ".imovielibrary": "iMovie",
+    ".theater": "iMovie",
+    ".tvlibrary": "TV",
+    ".musiclibrary": "Music",
+    ".aplibrary": "Aperture",
+    ".logicx": "Logic Pro",
+    ".fcpbundle": "Final Cut Pro",
+}
+
+
+def running_app_for(path):
+    """Name of the app that owns this library, if it is running right now."""
+    for suffix, app in LIBRARY_APPS.items():
+        if path.lower().endswith(suffix):
+            try:
+                r = subprocess.run(["pgrep", "-x", app], capture_output=True,
+                                   text=True, timeout=10)
+                return app if r.returncode == 0 else None
+            except Exception:
+                return None
+    return None
+
+
+def reopen_steps(rel):
+    low = rel.lower()
+    if low.endswith(".photoslibrary"):
+        return ["Hold Option and open Photos, then choose this library.",
+                "If it is your System Photo Library, open Photos > Settings >",
+                "General and click 'Use as System Photo Library' once."]
+    if low.endswith((".imovielibrary", ".theater")):
+        return ["Open iMovie, then File > Open Library > Other, and pick it."]
+    if low.endswith(".musiclibrary"):
+        return ["Hold Option and open Music, then choose this library."]
+    if low.endswith(".tvlibrary"):
+        return ["Hold Option and open TV, then choose this library."]
+    if low.endswith(".logicx"):
+        return ["Open the project from its new location; Logic will remember."]
+    if low.endswith(".fcpbundle"):
+        return ["Open Final Cut Pro, then File > Open Library > Other."]
+    return ["Open the owning app and point it at the new location."]
+
+
 def execute(approved, dest_root, opts):
     os.makedirs(dest_root, exist_ok=True)
     os.makedirs(os.path.join(STATE, "runs"), exist_ok=True)
@@ -1241,8 +1408,10 @@ def execute(approved, dest_root, opts):
     flags = rsync_flags()
     deletes = [x for x in approved if x["action"] == "DELETE"]
     archives = [x for x in approved if x["action"] == "ARCHIVE"]
+    relocates = [x for x in approved if x["action"] == "RELOCATE"]
     freed = 0
     failed = 0
+    relocated_ok = []
 
     if deletes:
         header("Deleting caches and build output")
@@ -1250,7 +1419,8 @@ def execute(approved, dest_root, opts):
             path = item["path"]
             print("  [%d/%d] %s  %s" % (i, len(deletes), human(item["bytes"]),
                                         rel_home(path)))
-            if regenerates(path) is None or is_never_touch(path):
+            if is_never_touch(path) or (regenerates(path) is None
+                                        and is_project_junk(path) is None):
                 print(red("      refused: not on the safe-delete list"))
                 failed += 1
                 continue
@@ -1314,6 +1484,75 @@ def execute(approved, dest_root, opts):
             log.write(json.dumps({"action": "ARCHIVE", "path": src,
                                   "dest": dst, "bytes": item["bytes"]}) + "\n")
 
+    if relocates:
+        header("Moving libraries to the drive")
+        print("  Copied and verified first, then the original is removed. No")
+        print("  symlink is left: these record their own location, so a link")
+        print("  would break them. You will get the reopen steps at the end.")
+        print()
+        for i, item in enumerate(relocates, 1):
+            src = item["path"]
+            rel = rel_home(src)
+            dst = os.path.join(dest_root, rel)
+            print("  [%d/%d] %s  %s" % (i, len(relocates), human(item["bytes"]), rel))
+
+            if is_never_touch(src) or is_hands_off(src):
+                print(red("      refused: protected path"))
+                failed += 1
+                continue
+            if not is_bundle(src):
+                print(red("      refused: not a recognised library bundle"))
+                failed += 1
+                continue
+            if os.path.exists(dst):
+                print(yellow("      already on the drive, skipping"))
+                continue
+            if running_app_for(src):
+                print(red("      refused: %s appears to be running. Quit it first."
+                          % running_app_for(src)))
+                failed += 1
+                continue
+
+            if not copy_tree(src, dst, flags):
+                failed += 1
+                continue
+
+            sf, sb = tally(src)
+            df, db = tally(dst)
+            if (sf, sb) != (df, db):
+                print(red("      VERIFY FAILED  source %d files/%s, copy %d files/%s"
+                          % (sf, human(sb), df, human(db))))
+                print(red("      original left in place"))
+                failed += 1
+                continue
+
+            try:
+                shutil.rmtree(src)
+            except Exception as exc:
+                print(red("      copy is on the drive but the original could not"))
+                print(red("      be removed: %s" % exc))
+                failed += 1
+                continue
+
+            freed += item["bytes"]
+            relocated_ok.append((rel, dst))
+            print(green("      moved"))
+            log.write(json.dumps({"action": "RELOCATE", "path": src,
+                                  "dest": dst, "bytes": item["bytes"]}) + "\n")
+
+        if relocated_ok:
+            print()
+            rule("=")
+            print("  " + bold("One more step for each library you just moved"))
+            rule("=")
+            for rel, dst in relocated_ok:
+                print()
+                print("  %s" % bold(rel))
+                print("     now at %s" % dst)
+                for line in reopen_steps(rel):
+                    print("     %s" % line)
+            print()
+
     log.close()
     return freed, failed, log_path
 
@@ -1335,7 +1574,8 @@ def undo(opts):
         return 1
 
     entries = [json.loads(line) for line in open(path) if line.strip()]
-    archived = [e for e in entries if e["action"] == "ARCHIVE"]
+    archived = [e for e in entries
+                if e["action"] in ("ARCHIVE", "RELOCATE")]
     deleted = [e for e in entries if e["action"] == "DELETE"]
 
     header("Undoing run %s" % target)
@@ -1470,7 +1710,7 @@ def main():
     p.add_argument("--undo", action="store_true", help="reverse the last run")
     p.add_argument("--run", help="which run to undo (default: most recent)")
     p.add_argument("--budget", type=float, default=WALK_BUDGET,
-                   help="seconds to spend on any one folder (default 90)")
+                   help="seconds to spend on any one folder (default 360)")
     p.add_argument("--cold-days", type=int, default=120, dest="cold_days")
     p.add_argument("--downloads-days", type=int, default=60,
                    dest="downloads_days")
@@ -1541,9 +1781,9 @@ def main():
         return 0
 
     reclaim = sum(c["bytes"] for c in candidates if c["action"] == "DELETE")
-    movable = sum(c["bytes"] for c in candidates if c["action"] == "ARCHIVE")
+    movable = sum(c["bytes"] for c in candidates if c["action"] != "DELETE")
     print()
-    print("  Found %s of deletable cache and %s that could be archived."
+    print("  Found %s of deletable cache and %s that could be moved to the drive."
           % (bold(human(reclaim)), bold(human(movable))))
 
     approved = review(candidates, opts)
@@ -1558,7 +1798,7 @@ def main():
         print("  Nothing approved. Exiting without changes.")
         return 0
 
-    need = sum(c["bytes"] for c in approved if c["action"] == "ARCHIVE")
+    need = sum(c["bytes"] for c in approved if c["action"] != "DELETE")
     if need:
         drive_free = shutil.disk_usage(dest_root if os.path.isdir(dest_root)
                                        else os.path.dirname(dest_root))[2]
@@ -1569,9 +1809,9 @@ def main():
             return 1
 
     d = len([x for x in approved if x["action"] == "DELETE"])
-    a = len([x for x in approved if x["action"] == "ARCHIVE"])
+    a = len([x for x in approved if x["action"] != "DELETE"])
     header("Ready")
-    print("  %d items to delete, %d to archive, %s total."
+    print("  %d items to delete, %d to move to the drive, %s total."
           % (d, a, human(sum(x["bytes"] for x in approved))))
     print()
     print("  Close other apps first if you can -- files in use may fail to move.")
