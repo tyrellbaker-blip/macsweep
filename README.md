@@ -2,18 +2,21 @@
 
 Reclaim disk space on a Mac without losing anything you care about.
 
-It does three things:
+It does four things:
 
 - **Delete** caches and build output that regenerate on their own
-- **Archive** cold files to an external drive, leaving a symlink so the
-  original path still works while the drive is plugged in
+- **Archive** cold files — including documents — to an external drive,
+  leaving a symlink so the original path still works while the drive is
+  plugged in
+- **Relocate** photo, video and music libraries to the drive, the way Apple
+  intends them to be moved
 - **Report** everything big it won't touch itself, with the exact command
   that reclaims it
 
 You approve each category before anything happens, and it explains what each
 one actually is before it asks.
 
-That third one matters more than it sounds. A narrow whitelist keeps the
+That last one matters more than it sounds. A narrow whitelist keeps the
 automatic deletion safe, but narrow must not mean silent: the biggest wins on
 a real machine are usually things no script should delete on its own —
 Homebrew and Anaconda in `/opt`, an oversized Spotlight index, old iPhone
@@ -49,7 +52,7 @@ went and what it *would* offer to do. Read it, then run it for real.
    explanation of what those files are. Answer y or n.
 4. **A final confirmation** before anything is touched.
 
-## The two actions it takes itself
+## The three actions it takes itself
 
 ### DELETE — gone, not in the Trash
 
@@ -82,11 +85,43 @@ The sequence is copy, verify, then delete:
 A mismatch leaves the original exactly where it was. There is no path through
 the code that deletes a source before its copy has been verified.
 
+This covers cold **documents and folders** too — old tax paperwork, finished
+coursework, the folder from a job you left. Nothing is judged by what's inside
+it, only by how long since you touched it, so read the list before approving.
+
 **The tradeoff, and it's a real one:** while the drive is unplugged, archived
 paths stop resolving. Symlinks dangle. Archive things you're genuinely done
 with, not the project you'll open tomorrow. Time Machine also follows symlinks
 as links rather than as their targets, so archived content stops being backed
 up — if it matters, back up the drive separately.
+
+### RELOCATE — for photo, video and music libraries
+
+A Photos or iMovie or Logic library is usually the largest single thing a
+non-developer owns, and moving one to an external drive is a supported,
+documented Apple workflow. But these bundles record their own location, so a
+symlink breaks them. They get their own action: copy, verify, remove the
+original, and deliberately **no link**. macsweep then prints the one-time
+reopen step:
+
+| library | how to reopen it |
+| --- | --- |
+| Photos | hold Option while opening Photos, choose it on the drive |
+| iMovie | File > Open Library > Other |
+| Music | hold Option while opening Music |
+| Final Cut | File > Open Library > Other |
+| Logic | open the project from its new location |
+
+After that the app remembers. With the drive unplugged the app says it can't
+find its library — it isn't damaged, it's on the drive.
+
+Two things to know: if it's your System Photo Library and you use iCloud
+Photos, keep the drive connected while Photos is open. And macsweep refuses to
+move a library while its app is running, because moving one out from under a
+running app corrupts it.
+
+`ARCHIVE` refuses library bundles and `RELOCATE` refuses anything that isn't
+one, so neither can be used to do the other's job by mistake.
 
 ## Undo
 
@@ -94,8 +129,8 @@ up — if it matters, back up the drive separately.
 python3 macsweep.py --undo
 ```
 
-Copies archived items back from the drive. Every run writes a log to
-`~/.macsweep/runs/`, so you can undo an older one with
+Copies archived and relocated items back from the drive. Every run writes a log
+to `~/.macsweep/runs/`, so you can undo an older one with
 `--undo --run 20260910T183000Z.jsonl`.
 
 Deletes can't be undone. That's what the whitelist is for.
@@ -117,16 +152,12 @@ The only exception is cloud folders, which genuinely cannot be walked — every
 dataless placeholder you `stat()` may trigger a download. Those are named and
 counted, not sized, with a pointer to the sync app's own eviction control.
 
-Two more categories are measured and reported but never acted on:
+Live application state is measured and reported but never acted on: Docker,
+UTM, Parallels, Steam, browser profiles, conda environments. Symlinking these
+breaks the app; deleting them loses real data.
 
-- **Live application state** — Docker, UTM, Parallels, Steam, browser profiles,
-  conda environments. Symlinking these breaks the app; deleting them loses real
-  data.
-- **Document bundles** — `.photoslibrary`, `.imovielibrary`, `.logicx`,
-  `.fcpbundle`. These look like folders but are single documents. Move them
-  from inside Photos or iMovie, never from a shell.
-
-Projects with uncommitted git changes are skipped automatically.
+Projects with uncommitted git changes are skipped automatically, and so are
+documents and folders you've touched recently.
 
 ## Two things that make the numbers correct
 
@@ -139,7 +170,23 @@ Desktop folder that reads as 21G when 475M is actually there. macsweep charges
 **Cloud folders are never walked.** Every dataless placeholder you `stat()` can
 trigger a network fetch, and a large iCloud library will stall a scan for
 hours. They're skipped by name, and any folder that exceeds a time budget
-(90s by default, `--budget`) is abandoned and flagged rather than left to hang.
+(6 minutes by default, `--budget`) is abandoned and flagged rather than left to hang.
+
+## Check it yourself before you trust it
+
+```
+python3 selftest.py
+```
+
+Builds a fake home folder and a fake drive in a temp directory, runs the real
+code against them, and checks what actually happened — 44 assertions covering
+sparse-file accounting, the build-output guard rules and their traps, the
+refusals, verify-before-delete, the relocate path, and undo. Your own files are
+never involved; `HOME` is redirected for the duration. Add `--keep` to leave
+the sandbox behind and poke at it.
+
+It's worth running once: two real bugs in this tool were found by it rather
+than by a user's disk.
 
 ## Options
 
@@ -149,7 +196,7 @@ hours. They're skipped by name, and any folder that exceeds a time budget
 | `--undo` | reverse the last run |
 | `--drive PATH` | skip the drive prompt |
 | `--folder NAME` | skip the folder-name prompt |
-| `--budget N` | seconds allowed per folder (default 90) |
+| `--budget N` | seconds allowed per folder (default 360, i.e. 6 minutes) |
 | `--cold-days N` | untouched days before a file counts as cold (120) |
 | `--downloads-days N` | same, for Downloads (60) |
 | `--project-days N` | same, for project folders (180) |
