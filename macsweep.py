@@ -114,6 +114,19 @@ REGENERATES = [
     ("Library/Application Support/Slack/Service Worker/CacheStorage", "Slack cache"),
     ("Library/Application Support/discord/Cache", "Discord cache"),
     ("Library/Application Support/Spotify/PersistentCache", "Spotify cache"),
+    (".Trash", "the Trash -- already deleted, just never emptied"),
+    (".cache/puppeteer", "downloaded Chromium builds"),
+    (".cache/ms-playwright", "downloaded browser builds"),
+    ("Library/Caches/ms-playwright", "downloaded browser builds"),
+    ("Library/Logs/DiagnosticReports", "crash logs"),
+    ("Library/Caches/JetBrains", "JetBrains IDE caches"),
+    ("Library/Developer/Xcode/UserData/Previews", "SwiftUI preview cache"),
+    ("Library/Developer/Xcode/Products", "Xcode build products"),
+    ("Library/Android/sdk/sources", "Android source jars, re-downloadable"),
+    ("Library/Android/sdk/emulator", "Android emulator binary, re-downloadable"),
+    (".expo", "Expo build cache"),
+    (".vagrant.d/boxes", "Vagrant box images"),
+    (".docker/buildx", "Docker build cache"),
 ]
 
 # Live application state. Measured and shown so you know where space went, but
@@ -155,6 +168,31 @@ NEVER_MOVE_SUFFIXES = (
     ".dmg.sparseimage",
 )
 
+# Build output that lives INSIDE a project folder. Each is a rebuild away, and
+# across years of projects this is normally the single largest recoverable
+# chunk on a developer machine. Each entry pairs the folder with a sibling file
+# that proves what it is: "build" alone could be source, "build" next to
+# build.gradle is Gradle output. An empty guard means the name is unambiguous.
+PROJECT_JUNK = [
+    ("node_modules", "package.json", "npm/yarn dependencies"),
+    ("Pods", "Podfile", "CocoaPods dependencies"),
+    (".next", "package.json", "Next.js build output"),
+    (".nuxt", "package.json", "Nuxt build output"),
+    (".svelte-kit", "package.json", "SvelteKit build output"),
+    ("target", "Cargo.toml", "Rust build output"),
+    ("target", "pom.xml", "Maven build output"),
+    ("build", "build.gradle", "Gradle build output"),
+    ("build", "build.gradle.kts", "Gradle build output"),
+    (".gradle", "build.gradle", "project-local Gradle cache"),
+    (".gradle", "build.gradle.kts", "project-local Gradle cache"),
+    ("DerivedData", "", "Xcode build output"),
+    ("__pycache__", "", "Python bytecode"),
+    (".pytest_cache", "", "pytest cache"),
+    (".mypy_cache", "", "mypy cache"),
+    (".ruff_cache", "", "ruff cache"),
+    (".tox", "tox.ini", "tox environments"),
+]
+
 # Cloud-synced. Two separate hazards: moving a file out forces a full download
 # first, and simply WALKING one can block for hours because every dataless
 # placeholder you stat() may trigger a network fetch. Never traversed.
@@ -174,7 +212,7 @@ CLOUD = [
 ]
 
 # Top-level home entries that are noise or already covered elsewhere.
-SKIP_HOME = {"Library", "Applications", "Public", ".Trash", "Desktop.localized"}
+SKIP_HOME = {"Library", "Applications", "Public", "Desktop.localized"}
 
 # Extra places worth measuring that a plain listing of ~ would miss.
 EXTRA_ROOTS = [
@@ -210,6 +248,22 @@ them on demand -- Xcode when you next attach a device, Android Studio through
 its SDK Manager. Deleting an Android AVD does lose that emulator's saved state
 (installed apps inside the emulator), so skip this one if you have an emulator
 set up mid-project."""),
+
+    ("projectjunk", "DELETE", "Build output inside your projects", """
+Every project you have ever run `npm install` or `cargo build` or `pod install`
+in left a folder of downloaded dependencies and compiled output behind. A
+single node_modules is a few hundred megabytes; twenty old projects is tens of
+gigabytes. None of it is your code -- it is all reconstructed by running the
+install or build command again.
+
+macsweep only counts a folder here when a sibling file proves what it is:
+node_modules next to package.json, target next to Cargo.toml, build next to
+build.gradle. A folder named "build" that is actually source is not touched."""),
+
+    ("trash", "DELETE", "The Trash", """
+Files you already deleted. They occupy disk until the Trash is emptied, which
+a lot of people never do. Nothing here is recoverable by macsweep afterward,
+but you already decided you didn't want it."""),
 
     ("logs", "DELETE", "Log files", """
 Diagnostic text written by apps and by macOS. Useful when something is broken
@@ -534,8 +588,11 @@ def collect_roots():
         p = os.path.abspath(os.path.expanduser(p))
         if p in seen or not os.path.isdir(p) or os.path.islink(p):
             return
-        if is_never_touch(p):
-            return
+        if is_cloud(p):
+            return          # walking these stalls for hours; see CLOUD
+        # NOTE: protected paths ARE measured. They are excluded from actions
+        # later, not from the report. A safety rule that hides where the space
+        # went is not a safety rule, it is a blind spot.
         seen.add(p)
         roots.append(p)
 
@@ -624,13 +681,22 @@ def scan(opts) -> dict:
                 "category": category_for_delete(child), "note": why,
             })
 
+    # --- Build output sitting inside project folders ----------------------
+    print("  checking project folders for build output...")
+    candidates += find_project_junk(opts, walker)
+
     # --- ARCHIVE candidates ----------------------------------------------
     candidates += find_archivable(opts, walker)
 
     candidates = prune_nested(candidates)
     candidates.sort(key=lambda x: x["bytes"], reverse=True)
 
-    return {"candidates": candidates, "measured": measured, "walker": walker}
+    # --- Everything big that macsweep will not touch itself ---------------
+    print("  looking outside the home folder...")
+    review = find_review(measured, opts)
+
+    return {"candidates": candidates, "measured": measured, "walker": walker,
+            "review": review}
 
 
 def children_of(path):
@@ -643,6 +709,8 @@ def children_of(path):
 
 def category_for_delete(path: str) -> str:
     r = rel_home(path)
+    if r == ".Trash" or r.startswith(".Trash/"):
+        return "trash"
     if "Developer/Xcode" in r or "CoreSimulator" in r or "Android" in r \
             or ".android" in r:
         return "devtools"
@@ -756,6 +824,234 @@ def find_archivable(opts, walker):
     return out
 
 
+def find_project_junk(opts, walker, max_depth=4):
+    """Find node_modules / target / Pods and friends inside project folders.
+
+    Walks a bounded depth from the usual project locations. Only counts a
+    folder when the guard file sits beside it, so a directory named "build"
+    that is really source code is never proposed.
+    """
+    starts = [HOME] + [os.path.join(HOME, n) for n in (
+        "Projects", "dev", "Developer", "Code", "src", "repos", "work",
+        "PycharmProjects", "IdeaProjects", "WebstormProjects", "CLionProjects",
+        "RiderProjects", "XcodeProjects", "AndroidStudioProjects",
+        "DataGripProjects", "GoLandProjects")]
+    by_name = {}
+    for name, guard, why in PROJECT_JUNK:
+        by_name.setdefault(name, []).append((guard, why))
+
+    found, seen = [], set()
+
+    def descend(folder, depth):
+        if depth > max_depth or is_cloud(folder) or is_never_touch(folder):
+            return
+        try:
+            with os.scandir(folder) as it:
+                kids = [e for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            return
+        names = set()
+        try:
+            with os.scandir(folder) as it:
+                names = {e.name for e in it}
+        except OSError:
+            pass
+        for kid in kids:
+            if kid.path in seen:
+                continue
+            rules = by_name.get(kid.name)
+            if rules:
+                why = None
+                for guard, description in rules:
+                    if not guard or guard in names or any(
+                            n.endswith(guard) for n in names):
+                        why = description
+                        break
+                if why:
+                    seen.add(kid.path)
+                    m = walker.measure(kid.path, opts.budget / 4)
+                    if m["bytes"] >= opts.min_mb * MB and not m["partial"]:
+                        found.append({
+                            "action": "DELETE", "path": kid.path,
+                            "bytes": m["bytes"], "files": m["files"],
+                            "age": age_days(m["newest"]),
+                            "category": "projectjunk", "note": why,
+                        })
+                    continue        # never descend into build output
+            if kid.name.startswith(".") and kid.name not in (".next", ".nuxt"):
+                continue
+            descend(kid.path, depth + 1)
+
+    for start in starts:
+        if os.path.isdir(start):
+            descend(start, 0)
+    return found
+
+
+def du_bytes(path, timeout=45):
+    """Size via du, for places Python cannot walk without sudo. None on fail."""
+    try:
+        r = subprocess.run(["du", "-skx", path], capture_output=True,
+                           text=True, timeout=timeout)
+        first = r.stdout.strip().split("\n")[0] if r.stdout.strip() else ""
+        if first:
+            return int(first.split()[0]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+# Things macsweep will not touch automatically but must never hide. Each is
+# reported with the exact command or menu that reclaims it.
+REVIEW_ADVICE = [
+    ("Library/Application Support/MobileSync", "Old iPhone and iPad backups.",
+     ["Finder > your device > Manage Backups, delete the old ones",
+      "ls -la ~/Library/Application\\ Support/MobileSync/Backup"]),
+    ("Library/Application Support/CrossOver", "Windows apps and games in CrossOver bottles.",
+     ["Delete a bottle from inside CrossOver, not from the shell"]),
+    ("Library/Application Support/Steam", "Installed games.",
+     ["Uninstall from Steam's own library view"]),
+    ("Library/Containers/com.utmapp.UTM", "UTM virtual machine disk images.",
+     ["Delete unused VMs from inside UTM"]),
+    ("Library/Containers/com.docker.docker", "Docker images, containers and volumes.",
+     ["docker system df", "docker system prune -a   # removes unused images"]),
+    ("Library/Application Support/JetBrains", "Old IDE versions and their indexes.",
+     ["JetBrains Toolbox > gear > uninstall versions you no longer run"]),
+    ("Library/Mail", "Offline copy of mail that also lives on the server.",
+     ["Mail > Settings > Accounts > Advanced, stop keeping copies offline"]),
+    ("Library/Messages", "Message history and every attachment ever sent to you.",
+     ["Messages > Settings > General > Keep messages: 1 Year",
+      "or copy ~/Library/Messages/Attachments to the drive first if you want to keep them"]),
+    ("Library/Metadata/CoreSpotlight", "Spotlight's content index. A cache, but it must be stopped before removal.",
+     ["sudo mdutil -a -i off",
+      "rm -rf ~/Library/Metadata/CoreSpotlight/*",
+      "sudo mdutil -a -i on    # then reboot; it rebuilds smaller"]),
+    ("Library/Photos", "Photos app caches and analysis data.",
+     ["Managed by Photos; use Photos > Settings > iCloud > Optimize Mac Storage"]),
+    ("miniconda3", "Conda environments and its package cache.",
+     ["conda clean --all       # cache only, environments untouched"]),
+    ("anaconda3", "Conda environments and its package cache.",
+     ["conda clean --all"]),
+    (".ollama", "Downloaded local language models.",
+     ["ollama list", "ollama rm <model>"]),
+]
+
+
+def find_review(measured, opts):
+    """Everything big that macsweep will not act on, with how to reclaim it.
+
+    This exists because the whitelist is deliberately narrow. Narrow must not
+    mean silent: if something large is on this disk, it appears here even when
+    macsweep refuses to touch it itself.
+    """
+    out = []
+
+    def add(title, size, why, commands):
+        out.append({"title": title, "bytes": size, "why": why,
+                    "commands": commands})
+
+    # 1a. Probe every path we have specific advice for, directly. Measuring
+    #     only top-level roots would bury a 2.5G VM image inside a generic
+    #     "Library/Containers" line with no way to act on it.
+    sized = {m["path"]: m["bytes"] for m in measured}
+    named = []
+    for prefix, why, cmds in REVIEW_ADVICE:
+        path = os.path.join(HOME, prefix)
+        if not os.path.isdir(path):
+            continue
+        size = sized.get(path)
+        if size is None:
+            size = du_bytes(path, 60)
+        if size and size >= 1 * GB:
+            named.append(path)
+            add(prefix, size, why, cmds)
+
+    # 1b. Anything else protected or live that is simply big, so a folder with
+    #     no tailored advice still gets named rather than silently dropped.
+    for m in measured:
+        if m["bytes"] < 1 * GB:
+            continue
+        path = m["path"]
+        if not (is_hands_off(path) or is_never_touch(path)):
+            continue
+        if path in named:
+            continue
+        why = "Live application data. macsweep will not touch it."
+        inner = [p for p in named if p.startswith(path + os.sep)]
+        if inner:
+            why += " Includes %s listed separately above." % (
+                ", ".join(os.path.basename(p) for p in inner))
+        add(rel_home(path), m["bytes"], why,
+            ["Remove it from inside the app that owns it"])
+
+    # 2. Outside the home folder entirely -- the blind spot that matters most.
+    for path, why, cmds in (
+        ("/Applications", "Installed applications.",
+         ["du -shx /Applications/* | sort -rh | head -20",
+          "Drag the ones you don't use to the Trash"]),
+        ("/opt/homebrew", "Homebrew packages, old versions and download cache.",
+         ["brew cleanup -n        # preview", "brew cleanup --prune=all",
+          "rm -rf \"$(brew --cache)\""]),
+        ("/usr/local/Homebrew", "Homebrew (Intel location).",
+         ["brew cleanup --prune=all"]),
+        ("/opt/anaconda3", "System-wide Anaconda install.",
+         ["conda clean --all"]),
+        ("/Library/Updates", "Downloaded macOS update installers.",
+         ["Install the update, or: sudo rm -rf /Library/Updates/*"]),
+        ("/Library/Application Support", "System-wide application support files.",
+         ["sudo du -shx /Library/Application\\ Support/* | sort -rh | head"]),
+    ):
+        if not os.path.isdir(path):
+            continue
+        size = du_bytes(path)
+        if size and size >= 1 * GB:
+            add(path, size, why, cmds)
+
+    # 3. Local Time Machine snapshots. These pin blocks you already freed, so
+    #    deleting things appears to accomplish nothing until they are thinned.
+    try:
+        r = subprocess.run(["tmutil", "listlocalsnapshots", "/"],
+                           capture_output=True, text=True, timeout=30)
+        snaps = [l for l in r.stdout.splitlines()
+                 if l.strip().startswith("com.apple.TimeMachine")]
+        if snaps:
+            add("%d local Time Machine snapshots" % len(snaps), 0,
+                "Snapshots hold on to blocks you have already deleted, so "
+                "freed space may not show up until they are thinned.",
+                ["sudo tmutil thinlocalsnapshots / 100000000000 4",
+                 "df -h /System/Volumes/Data"])
+    except Exception:
+        pass
+
+    # 4. Cloud folders: never walked, so ask the sync app instead.
+    cloud_dirs = []
+    for base in (os.path.join(HOME, "Library", "CloudStorage"),):
+        if os.path.isdir(base):
+            cloud_dirs += [os.path.join(base, n) for n in os.listdir(base)]
+    if os.path.isdir(os.path.join(HOME, "Library", "Mobile Documents")):
+        cloud_dirs.append(os.path.join(HOME, "Library", "Mobile Documents"))
+    if cloud_dirs:
+        add("%d cloud-synced folders" % len(cloud_dirs), 0,
+            "Not measured, because reading them forces downloads. Files kept "
+            "locally here can be evicted without losing anything.",
+            ["iCloud: System Settings > your name > iCloud > Optimize Mac Storage",
+             "or right-click an item in Finder > Remove Download",
+             "OneDrive / Dropbox / Google Drive: the app's own 'free up space'"])
+
+    # 5. Simulators, which accumulate silently.
+    sim = os.path.join(HOME, "Library/Developer/CoreSimulator/Devices")
+    if os.path.isdir(sim):
+        size = du_bytes(sim, 60)
+        if size and size >= 1 * GB:
+            add("Library/Developer/CoreSimulator/Devices", size,
+                "Simulator devices, including ones for SDKs you no longer have.",
+                ["xcrun simctl delete unavailable   # safe: only orphans",
+                 "xcrun simctl erase all            # wipes all simulator content"])
+
+    out.sort(key=lambda x: x["bytes"], reverse=True)
+    return out
+
+
 def list_entries(folder):
     try:
         with os.scandir(folder) as it:
@@ -843,6 +1139,36 @@ def review(candidates, opts):
             print(dim("    skipped"))
 
     return approved
+
+
+def show_review(review):
+    """Print what macsweep found but will not touch, with how to reclaim it.
+
+    The whitelist is narrow on purpose. This section is what keeps narrow from
+    turning into silent: if it is big and on this disk, it is named here even
+    when macsweep refuses to act on it.
+    """
+    if not review:
+        return
+    known = sum(f["bytes"] for f in review)
+    header("Bigger wins macsweep will not do for you  --  %s located"
+           % human(known))
+    print("""
+  Each of these is either live application data, outside your home folder, or
+  managed by another program. Deleting them from a script would be reckless,
+  so macsweep measures them and hands you the exact command instead. Several
+  are usually larger than everything macsweep can clean on its own.
+""".strip("\n"))
+    print()
+    for f in review:
+        size = human(f["bytes"]) if f["bytes"] else "     ?"
+        print("  %9s  %s" % (size, bold(f["title"])))
+        print("             %s" % f["why"])
+        for cmd in f["commands"]:
+            print(dim("             $ ") + cyan(cmd) if cmd.startswith(
+                ("brew", "conda", "docker", "sudo", "rm ", "du ", "xcrun",
+                 "ollama", "df ", "ls ")) else "             " + dim(cmd))
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1398,15 @@ def write_report(result, dest_root, approved, opts):
             flag = "  [partial measurement]"
         a("  %9s  %s%s" % (human(m["bytes"]), rel_home(m["path"]), flag))
     a("")
+    a("Worth doing by hand (macsweep will not touch these):")
+    for f in result.get("review", []):
+        a("  %9s  %s" % (human(f["bytes"]) if f["bytes"] else "?", f["title"]))
+        a("             %s" % f["why"])
+        for cmd in f["commands"]:
+            a("             %s" % cmd)
+    if not result.get("review"):
+        a("  (nothing)")
+    a("")
     a("Acted on this run:")
     for item in approved:
         a("  %-8s %9s  %s" % (item["action"], human(item["bytes"]),
@@ -1196,9 +1531,13 @@ def main():
                   % walker.skipped_cloud))
         print(dim("  'free up space' or 'remove download' to reclaim those."))
 
+    show_review(result.get("review", []))
+
     if not candidates:
         print()
-        print(green("  Nothing worth acting on. Your disk is already tidy."))
+        print(green("  Nothing macsweep can act on itself."))
+        if result.get("review"):
+            print("  The items above are still worth working through by hand.")
         return 0
 
     reclaim = sum(c["bytes"] for c in candidates if c["action"] == "DELETE")
