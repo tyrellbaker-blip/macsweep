@@ -16,9 +16,7 @@ It does four things:
 You approve each category before anything happens, and it explains what each
 one actually is before it asks.
 
-That last one matters more than it sounds. A narrow whitelist keeps the
-automatic deletion safe, but narrow must not mean silent: the biggest wins on
-a real machine are usually things no script should delete on its own —
+ A narrow whitelist keeps the automatic deletion safe, but narrow must not mean silent: the biggest wins on are usually things no script should delete on its own —
 Homebrew and Anaconda in `/opt`, an oversized Spotlight index, old iPhone
 backups, a Windows game inside a CrossOver bottle, `/Applications` itself.
 macsweep measures all of it and hands you the command. It will never quietly
@@ -30,9 +28,9 @@ cd macsweep
 python3 macsweep.py
 ```
 
-That's the whole install. No dependencies, one file, macOS and Python 3.8+.
 
-## First time? Do this
+
+## First time
 
 ```
 python3 macsweep.py --scan-only
@@ -54,7 +52,7 @@ went and what it *would* offer to do. Read it, then run it for real.
 
 ## The three actions it takes itself
 
-### DELETE — gone, not in the Trash
+### DELETE — gone, not in the Trash bin
 
 Only from a fixed whitelist in the source: Gradle and npm and Maven caches,
 Xcode DerivedData and device support, Android emulator images, `Library/Caches`,
@@ -62,7 +60,7 @@ Xcode DerivedData and device support, Android emulator images, `Library/Caches`,
 them is rebuilt or re-downloaded on demand.
 
 It also finds build output **inside your projects** — `node_modules`, `target`,
-`Pods`, `.next`, `build`. Across years of projects this is often the single
+`Pods`, `.next`, `build`. This is probably the single
 largest recoverable chunk on a developer's machine. Each one is only counted
 when a sibling file proves what it is: `node_modules` beside `package.json`,
 `target` beside `Cargo.toml`, `build` beside `build.gradle`. A folder named
@@ -89,7 +87,7 @@ This covers cold **documents and folders** too — old tax paperwork, finished
 coursework, the folder from a job you left. Nothing is judged by what's inside
 it, only by how long since you touched it, so read the list before approving.
 
-**The tradeoff, and it's a real one:** while the drive is unplugged, archived
+**The tradeoff:** while the drive is unplugged, archived
 paths stop resolving. Symlinks dangle. Archive things you're genuinely done
 with, not the project you'll open tomorrow. Time Machine also follows symlinks
 as links rather than as their targets, so archived content stops being backed
