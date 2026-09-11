@@ -16,19 +16,18 @@ It does four things:
 You approve each category before anything happens, and it explains what each
 one actually is before it asks.
 
- A narrow whitelist keeps the automatic deletion safe, but narrow must not mean silent: the biggest wins on are usually things no script should delete on its own —
-Homebrew and Anaconda in `/opt`, an oversized Spotlight index, old iPhone
-backups, a Windows game inside a CrossOver bottle, `/Applications` itself.
-macsweep measures all of it and hands you the command. It will never quietly
-omit a number because it decided not to act on it.
+A narrow whitelist keeps the automatic deletion safe, but narrow must not
+mean silent: the biggest wins on a real machine are usually things no script
+should delete on its own — Homebrew and Anaconda in `/opt`, an oversized
+Spotlight index, old iPhone backups, a Windows game inside a CrossOver bottle,
+`/Applications` itself. macsweep measures all of it and hands you the command.
+It will never quietly omit a number because it decided not to act on it.
 
 ```
 git clone https://github.com/tyrellbaker-blip/macsweep.git
 cd macsweep
 python3 macsweep.py
 ```
-
-
 
 ## First time
 
